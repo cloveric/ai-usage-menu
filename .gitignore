@@ -1,0 +1,22 @@
+# SwiftPM / Xcode
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+
+# Packaged applications and release archives
+dist/
+release/
+*.zip
+
+# macOS metadata
+.DS_Store
+
+# Local design references and QA captures. These can contain desktop context.
+/*.png
+/Resources/
+/design-qa.md
+
+# Local logs and diagnostics
+*.log
+*.trace

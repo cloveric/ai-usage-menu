@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-check:
+    name: Build and core checks
+    runs-on: macos-26
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Resolve pinned dependencies
+        run: swift package resolve
+
+      - name: Build release configuration
+        run: swift build -c release
+
+      - name: Run core checks
+        run: swift run -c release CoreChecks
