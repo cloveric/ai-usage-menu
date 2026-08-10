@@ -280,9 +280,10 @@ private enum BrandAsset {
         {
             image = bundledImage
         } else {
-            let developmentURL = URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()
-                .appendingPathComponent("Resources", isDirectory: true)
+            let developmentURL = URL(
+                fileURLWithPath: FileManager.default.currentDirectoryPath,
+                isDirectory: true)
+                .appendingPathComponent("Sources/AIUsageMenu/Resources", isDirectory: true)
                 .appendingPathComponent("\(name).png", isDirectory: false)
             image = NSImage(contentsOf: developmentURL)
         }

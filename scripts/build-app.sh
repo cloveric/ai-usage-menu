@@ -14,8 +14,22 @@ case "$APP_DIR" in
 esac
 
 cd "$PROJECT_DIR"
-swift build -c release --product AIUsageMenu
-BIN_DIR="$(swift build -c release --show-bin-path)"
+TASK_TEMP_ROOT="${TMPDIR:-/tmp}"
+TASK_TEMP_ROOT="${TASK_TEMP_ROOT%/}"
+SCRATCH_DIR="$(mktemp -d "$TASK_TEMP_ROOT/ai-usage-menu-build.XXXXXX")"
+
+cleanup_scratch() {
+    case "$SCRATCH_DIR" in
+        "$TASK_TEMP_ROOT"/ai-usage-menu-build.*) rm -rf "$SCRATCH_DIR" ;;
+        *) echo "拒绝清理意外构建目录：$SCRATCH_DIR" >&2 ;;
+    esac
+}
+trap cleanup_scratch EXIT
+
+# Dependencies are built in an isolated, non-personal path so SwiftPM's runtime
+# resource fallback cannot embed the developer's home directory in the app.
+swift build --scratch-path "$SCRATCH_DIR" -c release --product AIUsageMenu -Xswiftc -gnone
+BIN_DIR="$(swift build --scratch-path "$SCRATCH_DIR" -c release --show-bin-path)"
 
 rm -rf "$APP_DIR"
 mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
@@ -31,6 +45,8 @@ while IFS= read -r bundle; do
     cp -R "$bundle" "$APP_DIR/Contents/Resources/"
 done < <(find "$BIN_DIR" -maxdepth 1 -type d -name '*.bundle' -print)
 
+# Release binaries should not disclose the build machine's source paths.
+strip -S -x "$APP_DIR/Contents/MacOS/AIUsageMenu"
 codesign --force --deep --sign - "$APP_DIR"
 codesign --verify --deep --strict "$APP_DIR"
 echo "$APP_DIR"
