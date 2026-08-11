@@ -125,6 +125,69 @@ struct CoreChecks {
         if UsageFallbackPolicy.canUseRecentCache(old, now: now) {
             failures.append("超过一小时的 Kimi 缓存不应阻止 CLI 恢复探测")
         }
+
+        let recentClaudeCLI = ProviderUsage(
+            provider: .claude,
+            main: QuotaWindow(usedPercent: 49, windowMinutes: 7 * 24 * 60),
+            fiveHour: QuotaWindow(usedPercent: 0, windowMinutes: 5 * 60),
+            fable5: QuotaWindow(usedPercent: 90, windowMinutes: 7 * 24 * 60),
+            connection: .connected,
+            source: "Claude CLI /usage（30 分钟自动刷新）",
+            updatedAt: now.addingTimeInterval(-29 * 60))
+        if !ClaudeRefreshPolicy.canReuseAutomaticSnapshot(recentClaudeCLI, now: now) {
+            failures.append("Claude CLI 的 30 分钟内结果应避免重复拉起高内存进程")
+        }
+
+        let dueClaudeCLI = ProviderUsage(
+            provider: .claude,
+            main: recentClaudeCLI.main,
+            fiveHour: recentClaudeCLI.fiveHour,
+            fable5: recentClaudeCLI.fable5,
+            connection: .connected,
+            source: recentClaudeCLI.source,
+            updatedAt: now.addingTimeInterval(-30 * 60))
+        if ClaudeRefreshPolicy.canReuseAutomaticSnapshot(dueClaudeCLI, now: now) {
+            failures.append("Claude CLI 结果满 30 分钟后应允许自动更新")
+        }
+
+        let oauthSnapshot = ProviderUsage(
+            provider: .claude,
+            main: recentClaudeCLI.main,
+            connection: .connected,
+            source: "Claude OAuth",
+            updatedAt: now.addingTimeInterval(-5 * 60))
+        if ClaudeRefreshPolicy.canReuseAutomaticSnapshot(oauthSnapshot, now: now) {
+            failures.append("Claude CLI 节流策略不应误用于其他数据源")
+        }
+
+        let fableWindow = QuotaWindow(
+            usedPercent: 90,
+            windowMinutes: 7 * 24 * 60,
+            resetsAt: now.addingTimeInterval(60 * 60))
+        let previousWithFable = ProviderUsage(
+            provider: .claude,
+            main: recentClaudeCLI.main,
+            fable5: fableWindow,
+            connection: .connected,
+            source: recentClaudeCLI.source,
+            updatedAt: now)
+        if ClaudeFableFallbackPolicy.reusableWindow(from: previousWithFable, now: now) != fableWindow {
+            failures.append("Claude Fable 在本周期内偶发漏抓时应保留最近值")
+        }
+
+        let expiredFable = ProviderUsage(
+            provider: .claude,
+            main: recentClaudeCLI.main,
+            fable5: QuotaWindow(
+                usedPercent: 90,
+                windowMinutes: 7 * 24 * 60,
+                resetsAt: now.addingTimeInterval(-1)),
+            connection: .connected,
+            source: recentClaudeCLI.source,
+            updatedAt: now)
+        if ClaudeFableFallbackPolicy.reusableWindow(from: expiredFable, now: now) != nil {
+            failures.append("Claude Fable 缓存应随额度周期到期")
+        }
     }
 
     private static func checkKimiParser(failures: inout [String]) {
@@ -147,6 +210,14 @@ struct CoreChecks {
                         + "fiveHour=\(String(describing: usage.fiveHour?.usedPercent)) "
                         + "reset=\(String(describing: usage.weekly.resetsAt))")
                 return
+            }
+
+            // Kimi's terminal UI can finish with a partial redraw containing
+            // only the label. The parser must recover the last complete row.
+            let partialFinalRedraw = output + "\nWeekly limit\n5h limit\n"
+            let redrawnUsage = try KimiTerminalParser.parse(partialFinalRedraw, now: now)
+            if redrawnUsage.weekly.usedPercent != 1 || redrawnUsage.fiveHour?.usedPercent != 0 {
+                failures.append("Kimi /usage 最后一帧不完整时丢失了前一帧的有效额度")
             }
         } catch {
             failures.append("Kimi /usage 样本解析失败：\(error.localizedDescription)")

@@ -49,11 +49,13 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    func refresh() async {
+    func refresh(forceClaudeRefresh: Bool = false) async {
         guard !self.isRefreshing, !self.usesFixture else { return }
         self.isRefreshing = true
         defer { self.isRefreshing = false }
-        let refreshed = await self.service.fetchAll(previous: self.snapshot)
+        let refreshed = await self.service.fetchAll(
+            previous: self.snapshot,
+            forceClaudeRefresh: forceClaudeRefresh)
         self.snapshot = refreshed
         do {
             try UsageCache.save(refreshed)

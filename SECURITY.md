@@ -24,6 +24,7 @@ If private vulnerability reporting is temporarily unavailable, open a public Iss
 ## Security model
 
 - Provider credentials remain in their original local stores and are not serialized by AI Usage Menu.
+- The application never queries Claude Code's Keychain item; the credential-owning official CLI returns quota metadata.
 - The application requests quota metadata only; it does not send prompts or generate provider traffic for the purpose of measuring usage.
 - Local Codex session fallback is read-only, bounded, time-limited, and marked stale.
 - Release builds are ad-hoc signed but not notarized. Verify release checksums and source before running software from any mirror.

@@ -21,6 +21,14 @@ struct UsageProbe {
             print(await UsageService().debugClaudeOAuthWindows())
             return
         }
+        if CommandLine.arguments.contains("--claude-cli") {
+            print(await UsageService().debugClaudeCLIWindows())
+            return
+        }
+        if CommandLine.arguments.contains("--kimi-api") {
+            print(await UsageService().debugKimiAPIWindows())
+            return
+        }
         let snapshot = await UsageService().fetchAll(previous: UsageCache.load())
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601

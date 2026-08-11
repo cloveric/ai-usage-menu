@@ -68,7 +68,7 @@ struct UsagePopoverView: View {
             }
             Spacer(minLength: 8)
             RefreshButton(isRefreshing: self.store.isRefreshing) {
-                Task { await self.store.refresh() }
+                Task { await self.store.refresh(forceClaudeRefresh: true) }
             }
         }
         .padding(.top, 12)
@@ -388,7 +388,7 @@ private struct DetailsPanel: View {
             }
 
             HStack {
-                Text("每 15 分钟自动刷新")
+                Text("基础 15 分钟 · Claude 30 分钟")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.white.opacity(0.42))
                 Spacer()

@@ -98,6 +98,29 @@ public enum UsageFallbackPolicy {
     }
 }
 
+public enum ClaudeRefreshPolicy {
+    /// Claude Code's credential-owning CLI is comparatively expensive to
+    /// launch. Automatic refreshes reuse a successful CLI snapshot for thirty
+    /// minutes; a user-initiated refresh can bypass this interval.
+    public static let automaticInterval: TimeInterval = 30 * 60
+
+    public static func canReuseAutomaticSnapshot(
+        _ usage: ProviderUsage,
+        now: Date = Date(),
+        maximumAge: TimeInterval = Self.automaticInterval) -> Bool
+    {
+        guard maximumAge >= 0,
+              usage.provider == .claude,
+              usage.main != nil,
+              usage.source.hasPrefix("Claude CLI /usage"),
+              let updatedAt = usage.updatedAt
+        else {
+            return false
+        }
+        return max(0, now.timeIntervalSince(updatedAt)) < maximumAge
+    }
+}
+
 public struct ProviderUsage: Codable, Equatable, Identifiable, Sendable {
     public let provider: UsageProvider
     /// The long-running quota lane used for the menu bar aggregate.
@@ -152,6 +175,27 @@ public struct ProviderUsage: Codable, Equatable, Identifiable, Sendable {
             source: self.source,
             updatedAt: self.updatedAt,
             errorMessage: error.localizedDescription)
+    }
+}
+
+public enum ClaudeFableFallbackPolicy {
+    /// Claude's terminal panel is rendered incrementally. If the scoped Fable
+    /// row misses one scrape, keep the last value only until that quota window
+    /// resets instead of making the row disappear.
+    public static func reusableWindow(
+        from previous: ProviderUsage?,
+        now: Date = Date()) -> QuotaWindow?
+    {
+        guard let previous,
+              previous.provider == .claude,
+              previous.connection != .disconnected,
+              let fable = previous.fable5,
+              let resetsAt = fable.resetsAt,
+              resetsAt > now
+        else {
+            return nil
+        }
+        return fable
     }
 }
 
@@ -232,7 +276,7 @@ public struct DashboardSnapshot: Codable, Equatable, Sendable {
                         windowMinutes: 7 * 24 * 60,
                         resetsAt: fableReset),
                     connection: .connected,
-                    source: "Claude OAuth / CLI",
+                    source: "Claude CLI /usage（30 分钟自动刷新）",
                     updatedAt: now),
                 ProviderUsage(
                     provider: .kimi,

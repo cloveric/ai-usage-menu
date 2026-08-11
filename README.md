@@ -37,8 +37,9 @@
 - 菜单栏直接显示三家主额度的平均剩余量，例如 `AI 71%`
 - Codex、Claude、Kimi 的 Weekly、5h、进度与重置时间
 - Claude Fable 5 独立额度
-- 手动刷新与每 15 分钟自动刷新
-- 网络故障时使用有时效标记的缓存，避免反复拉起高内存 CLI
+- Codex/Kimi 每 15 分钟自动刷新；Claude CLI 最多每 30 分钟启动一次，手动刷新可立即更新
+- 网络故障时只保留一小时内的有时效缓存；过期数据不会继续伪装成实时值
+- Kimi 短期令牌过期时，仅临时调用官方 CLI 完成刷新，读取 API 后立即退出
 - 普通窗口与菜单弹窗均使用 macOS 系统材质，而不是半透明渐变伪装
 - 无 Dock 图标、无广告、无遥测、无账号系统
 
@@ -53,17 +54,19 @@
 | Provider | Weekly | 5h | 额外额度 | 首选数据源 |
 |---|:---:|:---:|:---:|---|
 | Codex | ✓ | 上游提供时显示 | Codex Spark 诊断 | ChatGPT OAuth usage API |
-| Claude | ✓ | ✓ | Fable 5 | Claude OAuth usage API |
+| Claude | ✓ | ✓ | Fable 5 | 官方 Claude CLI `/usage` |
 | Kimi | ✓ | ✓ | — | Kimi Code usage API |
 
 Codex 有时只返回 `10080` 分钟 Weekly 窗口而不返回 `300` 分钟 5h 窗口。此时应用会明确显示“服务端暂未返回”，并保留正确的 Weekly 数据；不会用旧值推算当前 5h。
+
+AI 用量不再直接读取 `Claude Code-credentials` 钥匙串项目。Claude 额度由已经登录的官方 `claude` CLI 查询，因此凭据仍由 Claude Code 自己管理，应用只接收 `/usage` 返回的额度数字。若出现声称“AI 用量”要读取该项目的密码框，请直接拒绝并报告；当前实现不会主动发起这种访问。
 
 ## 安装
 
 ### 下载预编译版本
 
 1. 前往 [Releases](https://github.com/cloveric/ai-usage-menu/releases/latest)。
-2. 下载 `AI-Usage-Menu-v0.1.0-macOS-arm64.zip` 并解压。
+2. 下载 `AI-Usage-Menu-v0.1.1-macOS-arm64.zip` 并解压。
 3. 将 `AI 用量.app` 移入“应用程序”。
 4. 首次启动若 macOS 提示开发者未验证，请在 Finder 中右键应用并选择“打开”。
 
@@ -86,6 +89,8 @@ kimi
 - 不包含分析 SDK、广告 SDK、崩溃上报或自建服务器
 - 不把 OAuth token、API key、Cookie 或对话内容写入应用缓存
 - 本地缓存仅保存百分比、重置时间、来源、连接状态与更新时间
+- 超过一小时的旧缓存不会作为当前额度继续展示
+- 应用不直接读取 Claude Code 钥匙串，也不会索要、接收或保存 macOS 登录密码
 - Codex 实时请求失败时，只解析最近一小时会话文件中的数字 `rate_limits` 对象；不会解码或输出对话正文
 - 诊断命令默认输出经过约束的额度元数据，不输出凭据
 
@@ -93,7 +98,11 @@ kimi
 
 ## 资源占用
 
-在维护者的 Apple silicon Mac 上，长期运行并完成多次自动刷新后，实测物理内存通常约为 **18–32 MB**，空闲时没有常驻子进程。不同系统版本、账户状态和 Swift 运行时可能产生差异。
+在维护者的 Apple silicon Mac 上，长期运行并完成多次自动刷新后，主程序物理内存通常约为 **18–32 MB**，空闲时没有常驻子进程。不同系统版本、账户状态和 Swift 运行时可能产生差异。
+
+Claude Code CLI 本身较重：实测 `/usage` 查询会短暂占用约 **200–325 MB** 物理内存，通常十几秒后退出。为控制资源，后台最多每 30 分钟启动一次；点击刷新按钮时可立即更新。它不会常驻，也不会每 15 分钟重复启动。
+
+Kimi 凭据需要刷新时会短暂启动官方 `kimi` 进程，刷新结束即终止；它不是常驻后台服务。
 
 ## 从源码构建
 
@@ -121,12 +130,14 @@ open "dist/AI 用量.app"
 ./scripts/run-probe.sh
 ```
 
-只检查 Codex 窗口：
+只检查单个数据源：
 
 ```bash
 swift run UsageProbe --codex-oauth
 swift run UsageProbe --raw-codex
 swift run UsageProbe --codex-local
+swift run UsageProbe --claude-cli
+swift run UsageProbe --kimi-api
 ```
 
 发布 Issue 前请删除账号标识、用户名路径和任何你不确定是否敏感的字段。
@@ -138,7 +149,7 @@ swift run UsageProbe --codex-local
 ```mermaid
 flowchart LR
     C[Codex OAuth] --> S[UsageService]
-    A[Claude OAuth] --> S
+    A[Claude CLI /usage] --> S
     K[Kimi Code API] --> S
     S --> P[严格窗口分类]
     P --> M[内存快照]

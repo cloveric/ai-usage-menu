@@ -56,12 +56,30 @@ public enum KimiTerminalParser {
         minutes: Int,
         now: Date) -> QuotaWindow?
     {
-        guard let labelRange = text.range(of: label, options: [.caseInsensitive, .backwards]) else { return nil }
-        let rawTail = String(text[labelRange.upperBound...].prefix(700))
-        let boundaries = ["Weekly limit", "5h limit"].filter {
-            $0.caseInsensitiveCompare(label) != .orderedSame
+        // Terminal UIs redraw the same row several times. The final redraw can
+        // contain only the label, so try every occurrence from newest to oldest
+        // instead of trusting the final one unconditionally.
+        for labelRange in self.ranges(of: label, in: text).reversed() {
+            if let window = self.window(
+                after: labelRange,
+                in: text,
+                minutes: minutes,
+                now: now)
+            {
+                return window
+            }
         }
-        let boundaryOffsets = boundaries.compactMap { boundary in
+        return nil
+    }
+
+    private static func window(
+        after labelRange: Range<String.Index>,
+        in text: String,
+        minutes: Int,
+        now: Date) -> QuotaWindow?
+    {
+        let rawTail = String(text[labelRange.upperBound...].prefix(700))
+        let boundaryOffsets = ["Weekly limit", "5h limit"].compactMap { boundary in
             rawTail.range(of: boundary, options: .caseInsensitive)?.lowerBound
         }
         let tail = boundaryOffsets.min().map { String(rawTail[..<$0]) } ?? rawTail
@@ -81,6 +99,21 @@ public enum KimiTerminalParser {
             windowMinutes: minutes,
             resetsAt: resetsAt,
             resetDescription: durationText.map { "in \($0)" })
+    }
+
+    private static func ranges(of needle: String, in text: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var searchStart = text.startIndex
+        while searchStart < text.endIndex,
+              let range = text.range(
+                  of: needle,
+                  options: .caseInsensitive,
+                  range: searchStart..<text.endIndex)
+        {
+            ranges.append(range)
+            searchStart = range.upperBound
+        }
+        return ranges
     }
 
     private static func firstDouble(pattern: String, in text: String) -> Double? {

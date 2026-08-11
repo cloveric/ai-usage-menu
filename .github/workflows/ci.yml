@@ -30,7 +30,7 @@ jobs:
         run: swift package resolve
 
       - name: Build release configuration
-        run: swift build -c release
+        run: swift build -c release --product AIUsageMenu
 
       - name: Run core checks
         run: swift run -c release CoreChecks

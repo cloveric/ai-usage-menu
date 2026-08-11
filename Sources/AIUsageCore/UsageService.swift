@@ -8,7 +8,10 @@ public struct UsageService: Sendable {
         self.environment = Self.preparedEnvironment(from: environment)
     }
 
-    public func fetchAll(previous: DashboardSnapshot? = nil) async -> DashboardSnapshot {
+    public func fetchAll(
+        previous: DashboardSnapshot? = nil,
+        forceClaudeRefresh: Bool = false) async -> DashboardSnapshot
+    {
         let previousCodex = previous?.usage(for: .codex)
         let previousClaude = previous?.usage(for: .claude)
         let previousKimi = previous?.usage(for: .kimi)
@@ -16,7 +19,7 @@ public struct UsageService: Sendable {
             await self.fetchCodexResult(previous: previousCodex)
         }
         async let claude = self.fetchWithTimeout(provider: .claude, previous: previousClaude) {
-            await self.fetchClaudeResult(previous: previousClaude)
+            await self.fetchClaudeResult(previous: previousClaude, forceRefresh: forceClaudeRefresh)
         }
         async let kimi = self.fetchWithTimeout(provider: .kimi, previous: previousKimi) {
             await self.fetchKimiResult(previous: previousKimi)
@@ -160,6 +163,66 @@ public struct UsageService: Sendable {
         }
     }
 
+    /// Checks Claude through the credential-owning CLI and emits quota
+    /// metadata only. This is used to validate the no-Keychain-UI recovery
+    /// path; terminal text and credentials are never included in the output.
+    public func debugClaudeCLIWindows() async -> String {
+        do {
+            var preparedEnvironment = self.environment
+            preparedEnvironment["CLAUDE_CODE_SAFE_MODE"] = "1"
+            let environment = preparedEnvironment
+            let snapshot = try await ProviderProcessGate.shared.run {
+                try await ClaudeUsageFetcher(
+                    browserDetection: BrowserDetection(),
+                    environment: environment,
+                    runtime: .cli,
+                    dataSource: .cli,
+                    keepCLISessionsAlive: false)
+                    .loadLatestUsage()
+            }
+            let payload: [String: Any] = [
+                "primaryMinutes": snapshot.primary.windowMinutes ?? NSNull(),
+                "primaryUsedPercent": snapshot.primary.usedPercent,
+                "secondaryMinutes": snapshot.secondary?.windowMinutes ?? NSNull(),
+                "secondaryUsedPercent": snapshot.secondary?.usedPercent ?? NSNull(),
+                "extraTitles": snapshot.extraRateWindows.map(\.title),
+                "hasTerminalText": snapshot.rawText != nil,
+                "source": "Claude CLI /usage（安全模式）",
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return "Claude CLI probe failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Checks Kimi's structured usage endpoint without emitting credentials.
+    /// Only quota percentages, reset timestamps and the source label are
+    /// included in the diagnostic output.
+    public func debugKimiAPIWindows() async -> String {
+        do {
+            let usage = try await self.fetchKimiViaAPI()
+            func dictionary(_ window: QuotaWindow?) -> [String: Any]? {
+                guard let window else { return nil }
+                return [
+                    "usedPercent": window.usedPercent,
+                    "remainingPercent": window.remainingPercent,
+                    "windowMinutes": window.windowMinutes ?? NSNull(),
+                    "resetsAt": window.resetsAt?.timeIntervalSince1970 ?? NSNull(),
+                ]
+            }
+            let payload: [String: Any] = [
+                "source": usage.source,
+                "weekly": dictionary(usage.main) ?? NSNull(),
+                "fiveHour": dictionary(usage.fiveHour) ?? NSNull(),
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            return String(decoding: data, as: UTF8.self)
+        } catch {
+            return "Kimi API probe failed: \(error.localizedDescription)"
+        }
+    }
+
     private func fetchCodexResult(previous: ProviderUsage?) async -> ProviderUsage {
         var oauthError: Error?
         do {
@@ -241,129 +304,228 @@ public struct UsageService: Sendable {
         }
     }
 
-    private func fetchClaudeResult(previous: ProviderUsage?) async -> ProviderUsage {
+    private func fetchClaudeResult(previous: ProviderUsage?, forceRefresh: Bool) async -> ProviderUsage {
+        if !forceRefresh,
+           let previous,
+           ClaudeRefreshPolicy.canReuseAutomaticSnapshot(previous)
+        {
+            return previous
+        }
+
         var preparedClaudeEnvironment = self.environment
         // Keeps built-in /usage and authentication while disabling project
         // hooks, plugins, LSPs and MCP startup for this read-only probe.
         preparedClaudeEnvironment["CLAUDE_CODE_SAFE_MODE"] = "1"
         let claudeEnvironment = preparedClaudeEnvironment
-        do {
-            var snapshot: ClaudeUsageSnapshot
-            var source: String
+
+        var oauthError: Error?
+        if Self.hasClaudeEnvironmentOAuthToken(claudeEnvironment) {
             do {
                 let oauth = try await self.fetchClaudeOAuth(environment: claudeEnvironment)
-                snapshot = oauth.snapshot
-                source = oauth.source
+                return try Self.claudeUsage(from: oauth.snapshot, source: oauth.source)
             } catch {
-                if Self.isCancellation(error) { throw error }
-                if let previous, UsageFallbackPolicy.canUseRecentCache(previous) {
-                    let cachedError = ProviderReadError.multiple(
-                        "Claude OAuth 暂时失败：\(error.localizedDescription)；已保留最近缓存，未启动高内存 CLI")
-                    return previous.keepingCachedValue(after: cachedError)
+                if Self.isCancellation(error) {
+                    return Self.failed(provider: .claude, error: error, previous: previous)
                 }
-                snapshot = try await ProviderProcessGate.shared.run {
-                    try await ClaudeUsageFetcher(
-                        browserDetection: BrowserDetection(),
-                        environment: claudeEnvironment,
-                        dataSource: .cli)
-                        .loadLatestUsage()
-                }
-                source = "Claude CLI /usage（安全模式）"
+                oauthError = error
             }
+        }
 
-            // A successful OAuth response is authoritative. Starting a full
-            // Claude CLI merely because the optional Fable lane is absent can
-            // cost hundreds of MB on accounts that are not entitled to it.
-            // CLI remains the fallback for an OAuth failure above.
-            let fable = Self.fableWindow(in: snapshot)
-
-            guard let mainWindow = Self.preferredWeeklyWindow(
-                primary: snapshot.primary,
-                secondary: snapshot.secondary)
-            else {
-                throw ProviderReadError.noQuota("Claude 没有返回周额度")
-            }
-            return ProviderUsage(
-                provider: .claude,
-                main: Self.quota(from: mainWindow),
-                fiveHour: Self.preferredFiveHourWindow(
-                    primary: snapshot.primary,
-                    secondary: snapshot.secondary).map(Self.quota(from:)),
-                fable5: fable.map(Self.quota(from:)),
-                connection: .connected,
-                source: source,
-                updatedAt: snapshot.updatedAt,
-                errorMessage: fable == nil ? "Fable 5 暂未出现在用量响应中" : nil)
+        do {
+            let snapshot = try await self.fetchClaudeViaCLI(environment: claudeEnvironment)
+            let usage = try Self.claudeUsage(
+                from: snapshot,
+                source: "Claude CLI /usage（30 分钟自动刷新）")
+            return Self.restoringRecentFableIfNeeded(usage, previous: previous)
         } catch {
-            return Self.failed(provider: .claude, error: error, previous: previous)
+            let combined = oauthError.map {
+                ProviderReadError.multiple(
+                    "Claude 环境 OAuth：\($0.localizedDescription)；CLI：\(error.localizedDescription)")
+            } ?? error
+            return Self.failed(provider: .claude, error: combined, previous: previous)
         }
     }
 
     private func fetchClaudeOAuth(environment: [String: String]) async throws
         -> (snapshot: ClaudeUsageSnapshot, source: String)
     {
-        var oauthEnvironment = environment
-        var source = "Claude OAuth"
-        if let credentials = try ClaudeKeychainCredentialsReader.load(), !credentials.isExpired {
-            oauthEnvironment[ClaudeOAuthCredentialsStore.environmentTokenKey] = credentials.accessToken
-            oauthEnvironment[ClaudeOAuthCredentialsStore.environmentScopesKey] = credentials.scopes.joined(separator: ",")
-            source = "Claude OAuth（无弹窗钥匙串）"
+        guard Self.hasClaudeEnvironmentOAuthToken(environment) else {
+            throw ProviderReadError.noQuota(
+                "未配置 CODEXBAR_CLAUDE_OAUTH_TOKEN；不会读取 Claude Code 钥匙串")
         }
         let snapshot = try await ClaudeUsageFetcher(
             browserDetection: BrowserDetection(),
-            environment: oauthEnvironment,
-            dataSource: .oauth)
+            environment: environment,
+            runtime: .cli,
+            dataSource: .oauth,
+            oauthSafeCredentialSourcesOnly: true,
+            allowBackgroundDelegatedRefresh: false)
             .loadLatestUsage()
-        return (snapshot, source)
+        return (snapshot, "Claude OAuth（环境变量）")
+    }
+
+    private func fetchClaudeViaCLI(environment: [String: String]) async throws -> ClaudeUsageSnapshot {
+        try await ProviderProcessGate.shared.run {
+            try await ClaudeUsageFetcher(
+                browserDetection: BrowserDetection(),
+                environment: environment,
+                runtime: .cli,
+                dataSource: .cli,
+                keepCLISessionsAlive: false)
+                .loadLatestUsage()
+        }
+    }
+
+    private static func hasClaudeEnvironmentOAuthToken(_ environment: [String: String]) -> Bool {
+        !(environment[ClaudeOAuthCredentialsStore.environmentTokenKey]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .isEmpty ?? true)
+    }
+
+    private static func claudeUsage(
+        from snapshot: ClaudeUsageSnapshot,
+        source: String) throws -> ProviderUsage
+    {
+        let fable = Self.fableWindow(in: snapshot)
+        guard let mainWindow = Self.preferredWeeklyWindow(
+            primary: snapshot.primary,
+            secondary: snapshot.secondary)
+        else {
+            throw ProviderReadError.noQuota("Claude 没有返回周额度")
+        }
+        return ProviderUsage(
+            provider: .claude,
+            main: Self.quota(from: mainWindow),
+            fiveHour: Self.preferredFiveHourWindow(
+                primary: snapshot.primary,
+                secondary: snapshot.secondary).map(Self.quota(from:)),
+            fable5: fable.map(Self.quota(from:)),
+            connection: .connected,
+            source: source,
+            updatedAt: snapshot.updatedAt,
+            errorMessage: fable == nil ? "Fable 5 暂未出现在用量响应中" : nil)
+    }
+
+    private static func restoringRecentFableIfNeeded(
+        _ usage: ProviderUsage,
+        previous: ProviderUsage?) -> ProviderUsage
+    {
+        guard usage.fable5 == nil,
+              let cachedFable = ClaudeFableFallbackPolicy.reusableWindow(from: previous)
+        else {
+            return usage
+        }
+        return ProviderUsage(
+            provider: usage.provider,
+            main: usage.main,
+            fiveHour: usage.fiveHour,
+            fable5: cachedFable,
+            connection: usage.connection,
+            source: usage.source,
+            updatedAt: usage.updatedAt,
+            errorMessage: "Fable 5 本次未完成渲染，暂用当前周期的最近值")
     }
 
     private func fetchKimiResult(previous: ProviderUsage?) async -> ProviderUsage {
-        var apiError: Error?
+        let firstAPIError: Error
         do {
-            if let token = KimiSettingsReader.kimiCodeAccessToken(environment: self.environment) {
-                do {
-                    let baseURL = try KimiSettingsReader.codeAPIBaseURL(environment: self.environment)
-                    let snapshot = try await self.fetchKimiAPISnapshot(apiKey: token, baseURL: baseURL)
-                    guard let main = Self.preferredWeeklyWindow(
-                        primary: snapshot.primary,
-                        secondary: snapshot.secondary)
-                    else {
-                        throw ProviderReadError.noQuota("Kimi API 没有返回周额度")
-                    }
-                    return ProviderUsage(
-                        provider: .kimi,
-                        main: Self.quota(from: main),
-                        fiveHour: Self.preferredFiveHourWindow(
-                            primary: snapshot.primary,
-                            secondary: snapshot.secondary).map(Self.quota(from:)),
-                        connection: .connected,
-                        source: "Kimi Code API",
-                        updatedAt: snapshot.updatedAt)
-                } catch {
-                    if Self.isCancellation(error) { throw error }
-                    apiError = error
-                    if let previous, UsageFallbackPolicy.canUseRecentCache(previous) {
-                        let cachedError = ProviderReadError.multiple(
-                            "Kimi API 暂时失败：\(error.localizedDescription)；已保留最近缓存，未启动高内存 CLI")
-                        return previous.keepingCachedValue(after: cachedError)
-                    }
-                }
+            return try await self.fetchKimiViaAPI()
+        } catch {
+            if Self.isCancellation(error) {
+                return Self.failed(provider: .kimi, error: error, previous: previous)
+            }
+            firstAPIError = error
+        }
+
+        // Keep a recent value for transient API failures, but never let a
+        // near-expiry/invalid credential hide behind the cache: the official
+        // Kimi CLI owns refresh-token rotation and must be allowed to refresh it.
+        if let previous,
+           UsageFallbackPolicy.canUseRecentCache(previous),
+           !Self.isKimiCredentialError(firstAPIError)
+        {
+            let cachedError = ProviderReadError.multiple(
+                "Kimi API 暂时失败：\(firstAPIError.localizedDescription)；已保留最近缓存")
+            return previous.keepingCachedValue(after: cachedError)
+        }
+
+        var terminalUsage: KimiTerminalUsage?
+        var terminalError: Error?
+        do {
+            terminalUsage = try await self.fetchKimiViaTerminal()
+        } catch {
+            if Self.isCancellation(error) {
+                return Self.failed(provider: .kimi, error: error, previous: previous)
+            }
+            terminalError = error
+        }
+
+        // `/usage` can rotate Kimi's short-lived access token even when its
+        // terminal redraw is incomplete. Re-read the credential file and retry
+        // the structured endpoint before trusting parsed terminal text.
+        do {
+            return try await self.fetchKimiViaAPI()
+        } catch {
+            if Self.isCancellation(error) {
+                return Self.failed(provider: .kimi, error: error, previous: previous)
+            }
+            if let terminal = terminalUsage {
+                return ProviderUsage(
+                    provider: .kimi,
+                    main: terminal.weekly,
+                    fiveHour: terminal.fiveHour,
+                    connection: .connected,
+                    source: "Kimi CLI /usage",
+                    updatedAt: Date(),
+                    errorMessage: "API 重试失败，已使用 CLI 实时值：\(error.localizedDescription)")
             }
 
-            let terminal = try await self.fetchKimiViaTerminal()
-            return ProviderUsage(
-                provider: .kimi,
-                main: terminal.weekly,
-                fiveHour: terminal.fiveHour,
-                connection: .connected,
-                source: "Kimi CLI /usage",
-                updatedAt: Date(),
-                errorMessage: apiError.map { "API 已回退到 CLI：\($0.localizedDescription)" })
-        } catch {
-            let combinedError = apiError.map {
-                ProviderReadError.multiple("Kimi API：\($0.localizedDescription)；CLI：\(error.localizedDescription)")
-            } ?? error
+            let cliMessage = terminalError?.localizedDescription ?? "没有返回可解析的用量"
+            let combinedError = ProviderReadError.multiple(
+                "Kimi API：\(firstAPIError.localizedDescription)；CLI：\(cliMessage)；API 重试：\(error.localizedDescription)")
             return Self.failed(provider: .kimi, error: combinedError, previous: previous)
+        }
+    }
+
+    private func fetchKimiViaAPI() async throws -> ProviderUsage {
+        let token: String
+        if let codeToken = KimiSettingsReader.kimiCodeAccessToken(environment: self.environment) {
+            token = codeToken
+        } else if let configuredAPIKey = KimiSettingsReader.apiKey(environment: self.environment) {
+            token = configuredAPIKey
+        } else if KimiSettingsReader.hasKimiCodeCredential(environment: self.environment) {
+            throw KimiAPIError.expiredCodeCredential
+        } else {
+            throw KimiAPIError.missingToken
+        }
+
+        let baseURL = try KimiSettingsReader.codeAPIBaseURL(environment: self.environment)
+        let snapshot = try await self.fetchKimiAPISnapshot(apiKey: token, baseURL: baseURL)
+        guard let main = Self.preferredWeeklyWindow(
+            primary: snapshot.primary,
+            secondary: snapshot.secondary)
+        else {
+            throw ProviderReadError.noQuota("Kimi API 没有返回周额度")
+        }
+        return ProviderUsage(
+            provider: .kimi,
+            main: Self.quota(from: main),
+            fiveHour: Self.preferredFiveHourWindow(
+                primary: snapshot.primary,
+                secondary: snapshot.secondary).map(Self.quota(from:)),
+            connection: .connected,
+            source: "Kimi Code API",
+            updatedAt: snapshot.updatedAt)
+    }
+
+    private static func isKimiCredentialError(_ error: Error) -> Bool {
+        guard let kimiError = error as? KimiAPIError else { return false }
+        return switch kimiError {
+        case .missingToken, .invalidToken, .missingAPIKey, .invalidAPIKey,
+             .expiredCodeCredential, .invalidCodeCredential:
+            true
+        case .invalidRequest, .networkError, .apiError, .parseFailed:
+            false
         }
     }
 
@@ -379,8 +541,8 @@ public struct UsageService: Sendable {
                     idleTimeout: nil,
                     baseEnvironment: environment,
                     initialDelay: 2.0,
-                    stopOnSubstrings: ["Weekly limit"],
-                    settleAfterStop: 1.5,
+                    stopOnSubstrings: ["5h limit"],
+                    settleAfterStop: 2.0,
                     returnOnEmptyProcessExit: true)
                 options.sendEnterEvery = nil
                 let result = try TTYCommandRunner().run(binary: binary, send: "/usage\r", options: options)
@@ -516,7 +678,7 @@ public struct UsageService: Sendable {
     }
 
     private static func failed(provider: UsageProvider, error: Error, previous: ProviderUsage?) -> ProviderUsage {
-        if let previous, previous.main != nil {
+        if let previous, UsageFallbackPolicy.canUseRecentCache(previous) {
             return previous.keepingCachedValue(after: error)
         }
         return .disconnected(provider, message: error.localizedDescription)

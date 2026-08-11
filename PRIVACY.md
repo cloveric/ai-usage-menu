@@ -7,7 +7,7 @@ AI Usage Menu is designed to keep authentication and usage data on the user's Ma
 Depending on the providers enabled on the Mac, the application may access:
 
 - the existing Codex OAuth login maintained by Codex CLI;
-- the existing Claude Code OAuth credential stored in macOS Keychain;
+- quota output from the already authenticated official Claude Code CLI;
 - the existing Kimi Code login or configured API endpoint;
 - recent Codex session JSONL files, but only as a fallback after a live Codex request fails.
 
@@ -18,6 +18,14 @@ The application uses credentials in memory to contact the corresponding provider
 Normal refreshes contact only the configured provider endpoints used by Codex, Claude Code, and Kimi Code. This project does not operate a proxy, analytics endpoint, update-tracking endpoint, or account service.
 
 Provider clients may follow their normal authentication refresh flow. Review the pinned `CodexBarCore` dependency and `Package.resolved` when auditing network behavior.
+
+## Credential prompts
+
+AI Usage Menu does not query the `Claude Code-credentials` Keychain item. Claude Code remains the credential owner: the application starts the official `claude` executable in safe mode, requests `/usage`, parses quota metadata, and terminates it. The application never asks for, receives, or stores the Mac login password.
+
+Because Claude Code CLI startup is comparatively expensive, automatic refreshes reuse a successful Claude result for up to 30 minutes. A user-initiated refresh bypasses that interval. Terminal output is held in memory only for parsing and is not persisted.
+
+Kimi Code access tokens are short-lived. When an existing Kimi login needs rotation, the application may briefly run the official `kimi` CLI, then re-read the locally updated credential and return to the structured usage API. The CLI is terminated after the refresh and its terminal output is not persisted.
 
 ## Local storage
 
